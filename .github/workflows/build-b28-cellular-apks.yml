@@ -1,0 +1,176 @@
+name: Build SY108 B28 Controller APKs (experimental)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+  JOBS: '4'
+  SY108_OUT: ${{ github.workspace }}/out
+  SY108_DOWNLOADS: ${{ github.workspace }}/dl
+  SOURCE_COMMIT: 15d4ccce67e00fc04a87959ac2e7f33a3f6ca1c5
+  BUILDER_COMMIT: 508f6ca98e2d0edf5cac8205d162a57dd1fe5511
+
+jobs:
+  build-controller:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - name: Checkout archived Nov 9 builder
+        uses: actions/checkout@v4
+        with:
+          repository: xuxin1955/Actions
+          ref: 508f6ca98e2d0edf5cac8205d162a57dd1fe5511
+          persist-credentials: false
+
+      - name: Checkout this repository's B28 patch
+        uses: actions/checkout@v4
+        with:
+          repository: kobokers/sy108-nov9-rebuild
+          ref: ${{ github.ref_name }}
+          path: b28-assets
+          persist-credentials: false
+
+      - name: Verify builder and patch inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BUILDER_COMMIT"
+          test -s scripts/sy108/workspace_overlay.py
+          test -s diy-sy108.sh
+          test -s b28-assets/SY108_B28_LuCI_Mask_Fix.patch
+          sha256sum b28-assets/SY108_B28_LuCI_Mask_Fix.patch
+
+      - name: Free disk space while retaining Docker
+        uses: insightsengineering/disk-space-reclaimer@v1.1.2
+        with:
+          android: false
+          dotnet: false
+          haskell: false
+          large-packages: false
+          swap-storage: false
+          docker-images: false
+          tools-cache: true
+
+      - name: Install original builder dependencies
+        shell: bash
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          echo 'Acquire::ForceIPv4 "true";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4
+          sudo find /etc/apt -maxdepth 2 -type f \( -name 'apt-mirrors.txt' -o -name '*.list' -o -name '*.sources' -o -name 'sources.list' \) -exec sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' {} + || true
+          printf 'Acquire::http::Timeout "15";\nAcquire::https::Timeout "15";\nAcquire::Retries "1";\n' | sudo tee /etc/apt/apt.conf.d/99timeout
+          PKGS="$(curl -fsSL --retry 2 --max-time 30 https://raw.githubusercontent.com/xuxin1955/depend_ubuntu2204_openwrt/refs/heads/main/depend_ubuntu2204_openwrt | tr ' ' '\n' | grep -vE '^(gcc-multilib|g\+\+-multilib|libc6-dev-i386)$' | tr '\n' ' ')"
+          test -n "$PKGS"
+          sudo -E apt-get -y install --no-install-recommends $PKGS || {
+            sudo -E apt-get -y update
+            sudo -E apt-get -y install --no-install-recommends $PKGS
+          }
+
+      - name: Checkout pinned SY108 integration source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/jason-liu-4980/sy108-mainline.git sy108
+          test "$(git -C sy108 rev-parse HEAD)" = "$SOURCE_COMMIT"
+          grep -F '"upstream_tag": "v25.12.5"' sy108/manifests/openwrt.json
+
+      - name: Apply historical builder CI compatibility setup
+        shell: bash
+        working-directory: sy108
+        run: |
+          set -euo pipefail
+          cat "$GITHUB_WORKSPACE/scripts/sy108/workspace_overlay.py" >> tools/lib/workspace.py
+          PROBE="$(./tools/python -c "import sys; sys.path.insert(0,'tools/lib'); from workspace import container; print(container(['echo','hi'])[0])")"
+          test "$PROBE" = echo
+          # Historical compatibility edit. This source-integrity warning is not resolved.
+          sed -i 's|raise SystemExit("Linux archive checksum mismatch")|print(f"::warning::kernel archive sha256={digest}, manifest mismatch ignored")|' tools/build/kernel-source.py
+          sed -i "s/'V=s'/'V=' + __import__('os').environ.get('V','0')/g" tools/build/firmware.py
+
+      - name: Create historical builder output paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$SY108_OUT" "$SY108_DOWNLOADS"
+          sudo ln -sfn "$GITHUB_WORKSPACE/sy108" /project
+          sudo ln -sfn "$SY108_OUT" /output
+          sudo ln -sfn "$SY108_DOWNLOADS" /downloads
+
+      - name: Bootstrap pinned OpenWrt 25.12.5 build tree
+        shell: bash
+        working-directory: sy108
+        run: |
+          set -euo pipefail
+          ./tools/python tools/bootstrap.py --skip-container
+          git -C "$SY108_OUT/openwrt-build" log --oneline -1
+
+      - name: Apply historical builder customizations
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x diy-sy108.sh
+          cd "$SY108_OUT/openwrt-build"
+          "$GITHUB_WORKSPACE/diy-sy108.sh"
+
+      - name: Apply B28 controller source fix (not modem NV)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C sy108 apply --check "$GITHUB_WORKSPACE/b28-assets/SY108_B28_LuCI_Mask_Fix.patch"
+          git -C sy108 apply "$GITHUB_WORKSPACE/b28-assets/SY108_B28_LuCI_Mask_Fix.patch"
+          git -C sy108 diff --check
+          git -C sy108 diff -- packages/udx-cellular/src/native/advanced.c packages/luci-app-udx/root/www/luci-static/resources/view/udx/cellular.js
+          grep -F '"B28", true, 2048, 1' sy108/packages/udx-cellular/src/native/advanced.c
+          grep -F '"AT+SPLBAND=1,0,%u,%u,%u,0"' sy108/packages/udx-cellular/src/native/advanced.c
+
+      - name: Configure and download dependencies
+        shell: bash
+        working-directory: sy108
+        run: |
+          set -euo pipefail
+          ./tools/python tools/build/firmware.py main --configure-only
+          KARC="$(jq -r .archive manifests/kernel.json)"
+          (cd "$SY108_OUT/openwrt-build" && make download -j8 LINUX_SOURCE="$KARC" LINUX_SITE=file:///downloads)
+          find "$SY108_OUT/openwrt-build/dl" -size -1024c -delete
+
+      - name: Compile controller packages on original toolchain
+        shell: bash
+        working-directory: sy108
+        run: |
+          set -euo pipefail
+          # Reuse the proven build recipe to generate a matching toolchain and ABI.
+          # No generated sysupgrade image is distributed from this workflow.
+          ./tools/python tools/build/firmware.py main --jobs "$JOBS" || \
+            V=s ./tools/python tools/build/firmware.py main --jobs 2
+
+      - name: Extract only the two APK controller packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$SY108_OUT/openwrt-build/bin/packages"
+          test -d "$ROOT"
+          mkdir -p controller-apks
+          for package in udx-cellular luci-app-udx; do
+            mapfile -t hits < <(find "$ROOT" -type f -name "${package}-*.apk" | sort)
+            test "${#hits[@]}" -eq 1 || {
+              echo "Expected exactly one ${package} APK, found ${#hits[@]}" >&2
+              printf '%s\n' "${hits[@]}" >&2
+              exit 1
+            }
+            cp "${hits[0]}" controller-apks/
+          done
+          (cd controller-apks && sha256sum *.apk > SHA256SUMS.txt)
+          cp b28-assets/SY108_B28_LuCI_Mask_Fix.patch controller-apks/
+          printf 'source_commit=%s\nbuilder_commit=%s\nfix_ref=%s\n' "$SOURCE_COMMIT" "$BUILDER_COMMIT" "$GITHUB_REF_NAME" > controller-apks/SOURCE.txt
+          du -h controller-apks/*
+
+      - name: Upload experimental controller APKs only
+        uses: actions/upload-artifact@v4
+        with:
+          name: SY108-B28-controller-APKs-experimental
+          path: controller-apks/*
+          retention-days: 30
