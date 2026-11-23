@@ -1,7 +1,7 @@
 diff --git a/packages/udx-cellular/src/native/advanced.c b/packages/udx-cellular/src/native/advanced.c
 --- a/packages/udx-cellular/src/native/advanced.c
 +++ b/packages/udx-cellular/src/native/advanced.c
-@@ -8,11 +8,14 @@
+@@ -8,12 +8,15 @@
  struct band {
  	const char *name;
  	bool fdd;
@@ -22,6 +22,7 @@ diff --git a/packages/udx-cellular/src/native/advanced.c b/packages/udx-cellular
 +static const struct band nr[] = {{"n1", true, 1, 0}, {"n3", true, 4, 0}, {"n5", true, 16, 0},
 +				 {"n8", true, 128, 0}, {"n28", true, 512, 0}, {"n41", false, 16, 0},
 +				 {"n77", false, 128, 0}, {"n78", false, 256, 0}, {"n79", false, 512, 0}};
+ static const char *modes[] = {"lte_only", "nr_only", "nr_lte", "nr_lte_wcdma_gsm"},
 @@ -141,8 +142,8 @@ static J *decode_mask(struct controller *c, bool is_nr, bool capability)
  	}
  	if (!is_nr && values[0])
