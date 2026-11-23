@@ -1,0 +1,89 @@
+diff --git a/packages/udx-cellular/src/native/advanced.c b/packages/udx-cellular/src/native/advanced.c
+--- a/packages/udx-cellular/src/native/advanced.c
++++ b/packages/udx-cellular/src/native/advanced.c
+@@ -8,12 +8,15 @@
+ struct band {
+ 	const char *name;
+ 	bool fdd;
+ 	uint32_t bit;
++	uint8_t word;
+ };
+-static const struct band lte[] = {{"B1", true, 1},    {"B3", true, 4},	   {"B5", true, 16},
+-				  {"B8", true, 128},  {"B34", false, 2},   {"B38", false, 32},
+-				  {"B39", false, 64}, {"B40", false, 128}, {"B41", false, 256}};
+-static const struct band nr[] = {{"n1", true, 1},     {"n3", true, 4},	   {"n5", true, 16},
+-				 {"n8", true, 128},   {"n28", true, 512},  {"n41", false, 16},
+-				 {"n77", false, 128}, {"n78", false, 256}, {"n79", false, 512}};
++static const struct band lte[] = {{"B1", true, 1, 0}, {"B3", true, 4, 0}, {"B5", true, 16, 0},
++				  {"B8", true, 128, 0}, {"B28", true, 2048, 1},
++				  {"B34", false, 2, 0}, {"B38", false, 32, 0},
++				  {"B39", false, 64, 0}, {"B40", false, 128, 0},
++				  {"B41", false, 256, 0}};
++static const struct band nr[] = {{"n1", true, 1, 0}, {"n3", true, 4, 0}, {"n5", true, 16, 0},
++				 {"n8", true, 128, 0}, {"n28", true, 512, 0}, {"n41", false, 16, 0},
++				 {"n77", false, 128, 0}, {"n78", false, 256, 0}, {"n79", false, 512, 0}};
+ static const char *modes[] = {"lte_only", "nr_only", "nr_lte", "nr_lte_wcdma_gsm"},
+@@ -141,8 +142,8 @@ static J *decode_mask(struct controller *c, bool is_nr, bool capability)
+ 	}
+ 	if (!is_nr && values[0])
+ 		goto invalid;
+ 	J *m = is_nr ? mask_object(values[0], values[1], values[2], values[3])
+-		     : mask_object(values[3], values[4], values[1], values[2]);
++		     : mask_object(values[3], values[2], values[1], values[0]);
+ 	J *out = json_object_new_object(), *bands = json_object_new_array();
+ 	bool any = false;
+ 	for (size_t i = is_nr ? 0 : 1; i < count; i++)
+@@ -150,8 +151,8 @@ static J *decode_mask(struct controller *c, bool is_nr, bool capability)
+ 	const struct band *list = is_nr ? nr : lte;
+ 	size_t n = is_nr ? sizeof(nr) / sizeof(*nr) : sizeof(lte) / sizeof(*lte);
+ 	for (size_t i = 0; i < n; i++) {
+ 		uint32_t mask = (uint32_t)json_object_get_int64(
+-		    json_object_array_get_idx(get(m, list[i].fdd ? "fdd" : "tdd"), 0));
++		    json_object_array_get_idx(get(m, list[i].fdd ? "fdd" : "tdd"), list[i].word));
+ 		if (mask & list[i].bit)
+ 			json_object_array_add(bands, json_object_new_string(list[i].name));
+ 	}
+@@ -451,25 +452,26 @@
+ 	    (!strcmp(op, "unlock") && text_equal(str(args, "scope"), "bands"))) {
+ 		desired = json_object_new_object();
+ 		for (int r = 0; r < 2; r++) {
+-			uint32_t fdd = 0, tdd = 0;
++			uint32_t fdd[2] = {0, 0}, tdd = 0;
+ 			J *bands = get(args, r ? "nr" : "lte");
+ 			if (!strcmp(op, "band_lock"))
+ 				for (size_t i = 0; i < json_object_array_length(bands); i++) {
+ 					const struct band *b =
+ 					    find_band(r, json_object_get_string(
+ 							     json_object_array_get_idx(bands, i)));
+ 					if (b->fdd)
+-						fdd |= b->bit;
++						fdd[b->word] |= b->bit;
+ 					else
+ 						tdd |= b->bit;
+ 				}
+ 			json_object_object_add(desired, r ? "nr" : "lte",
+-					       mask_object(fdd, 0, tdd, 0));
++					       mask_object(fdd[0], fdd[1], tdd, 0));
+ 			char wire[160];
+ 			if (r)
+-				snprintf(wire, sizeof(wire), "AT+SPLBAND=2,%u,0,%u,0", fdd, tdd);
++				snprintf(wire, sizeof(wire), "AT+SPLBAND=2,%u,0,%u,0", fdd[0], tdd);
+ 			else
+-				snprintf(wire, sizeof(wire), "AT+SPLBAND=1,0,%u,0,%u,0", tdd, fdd);
++				snprintf(wire, sizeof(wire), "AT+SPLBAND=1,0,%u,%u,%u,0", tdd,
++					 fdd[1], fdd[0]);
+ 			if (command(c, wire, 50) < 0)
+ 				goto end;
+ 		}
+diff --git a/packages/luci-app-udx/root/www/luci-static/resources/view/udx/cellular.js b/packages/luci-app-udx/root/www/luci-static/resources/view/udx/cellular.js
+--- a/packages/luci-app-udx/root/www/luci-static/resources/view/udx/cellular.js
++++ b/packages/luci-app-udx/root/www/luci-static/resources/view/udx/cellular.js
+@@ -56,7 +56,7 @@
+             return o;
+         }
+         var lte = field('bands', form.MultiValue, 'lte', _('LTE bands'));
+-        ['B1', 'B3', 'B5', 'B8', 'B34', 'B38', 'B39', 'B40', 'B41'].forEach(function(b) {
++        ['B1', 'B3', 'B5', 'B8', 'B28', 'B34', 'B38', 'B39', 'B40', 'B41'].forEach(function(b) {
+             lte.value(b);
+         });
+         var nr = field('bands', form.MultiValue, 'nr', _('NR bands'));
